@@ -1,0 +1,213 @@
+---
+title: "Prep work for DiffExp Shiny"
+shorttitle: "Kidney Differential Expression"
+author:
+- name: Marty Ross; p.martin.ross@gmail.com
+package: GeoMxWorkflows, fgsea
+abstract: >
+    This vignette shows steps to process Differential Expression outputs from the 
+    GeoMxWorkflows vignette, up to ~line 1125 "## Between Slide Analysis: Diabetic 
+    Kidney Disease vs Healthy", and runs GSEA on the output sets to identify 
+    significantly differentially expressed genes. This vignette creates output 
+    that is ultimately used as input for a Shiny App to explore the results. This
+    vignette utilizes an S4 GeomxTools object that is an output from a spatial 
+    biology assay from a GeoMx Digital Spatial Profiler.
+date: "March 7, 2023"
+output: 
+    BiocStyle::html_document:
+        toc: true
+        toc_float: true
+vignette: >
+    %\VignetteIndexEntry{Analyzing GeoMx-NGS Data with GeomxTools}
+    %\VignetteEncoding{UTF-8}
+    %\VignetteEngine{knitr::rmarkdown}
+editor_options: 
+    chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE,
+        message = FALSE,
+        collapse=FALSE,
+        warning = FALSE,
+        results='asis',
+        fig.pos = "H")
+options(digits=12)
+library(NanoStringNCTools)
+library(GeomxTools)
+library(tidyverse)
+library(fgsea)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(reactome.db)
+library(stats)
+library(stringr)
+library(kableExtra)
+```
+
+# Compile Data Outputs from GeoMxWorkflows
+
+## Data Load
+
+This Data was a kidney set, comparing expression patterns between glomeruli and tubules, as well as well as between normal and diabetic kidney disease samples. This is the public dataset included in the GeoMxWorkflows package:
+
+<https://github.com/Nanostring-Biostats/GeoMxWorkflows>
+
+The upfront prepwork processing Human Whole Transcriptome Assay samples, from count files to S4 object, was simply running the vignette up to the 2 separate differential expression runs, around line 1125. The only data that need be carried forward for this workflow are be the 2 DE dataframes and the S4 object, saved to an RData file.
+
+`save(target_demoData, results, results2, file = "Data/dat.RData")`
+
+This gets reloaded here. Note that at this point, the 18,000+ genes of the assay have been culled to around 10,000 based on gene expression above the limit of quantitation in 10% of samples. Additionally, 8 samples have been dropped due to poor expression, from 229 to 221, mostly very small glomeruli.
+
+```{r loaddata}
+# save(target_demoData, results, results2, file = "Data/dat.RData")
+load("Data/dat.RData")
+kable(table(target_demoData$region, target_demoData$class), align = 'cc') %>%
+  kable_classic(full_width = FALSE)
+```
+
+## Process the DE outputs
+
+The two separate DE result dataframe outputs from the vignette are combined. In the original `GeoMxWorkflows` vignette, the DE function has used an implementation of the `lme4:lmer` function, and the outputs do not include mean expression. As such, appropriate subsetted mean log2 expressions from appropriate samples are extracted from the S4 object to enable downstream Bland-Altman [MA] plot generation.
+
+```{r preprocess, echo=TRUE}
+de_Results <- rbind(results, results2)
+rownames(de_Results) <- NULL
+
+de_Results$mn_exp <- 0
+# Append mean expression to `de_Results` DE table for MA plot
+for (test in unique(de_Results$Contrast)) {
+  for (subs in unique(de_Results$Subset)) {
+    # combine subset and test variables
+    crit <- c(str_split(test, ' - ')[[1]], subs)
+    # relevant samples
+    samps <- rownames(pData(target_demoData))[target_demoData$region %in% crit &
+                                                target_demoData$class %in% crit]
+    exp_df <- as.data.frame(assayDataElement(object = target_demoData, 
+                                             elt = "log_q"))[de_Results[de_Results$Contrast == test & 
+                                                                          de_Results$Subset == subs,]$Gene,
+                                                             which(colnames(target_demoData) %in% samps)]
+    # save gene-wise rowMeans to DE table
+    de_Results$mn_exp[de_Results$Contrast == test & 
+                        de_Results$Subset == subs] <- rowMeans(exp_df)
+
+  }
+}
+
+```
+
+## Differential Expression in Review
+
+The GeoMxWorkflows vignette performed 4 differential expression comparisons, which we will want the Shiny App to toggle between. Contrasts were run comparing glomeruli to tubule samples in DKD and normal samples, as well as comparing DKD to normal samples in glomeruli and tubule samples.
+
+``` {r de_review}
+# Build simple table based on unique DE tests
+tbl <- de_Results %>%
+  dplyr::select(c(Subset, Contrast)) %>%
+  mutate(test = paste0(Subset, ":", Contrast)) %>%
+  distinct(test) %>%
+  separate(test, into = c("Subset", "Contrast"), sep = ":", remove = TRUE)
+
+kable(tbl, align = 'll') %>%
+  kable_classic(full_width = FALSE)
+
+```
+
+# Run Gene Set Enrichment Analysis
+
+## Run Fast GSEA on DE Outputs
+
+Here I use the `fgseaMultilevel` function from the `fgsea` package to run pathway analysis on each of the unique tests, utilizing the `AnnotationDbi` human Reactome pathways. I'll extract 10 pathways up and down with associated genes which we will output for use in the Shiny app to highlight genes of interest.
+
+``` {r fgsea, message = FALSE, warning = FALSE, cache = TRUE}
+
+# map entrezIDs to gene names
+de_Results$entrez <- mapIds(org.Hs.eg.db, as.character(de_Results[["Gene"]]),
+                            'ENTREZID', 'SYMBOL')
+# filter entrez ids which return as NAs and drop them
+na_idx <- which(is.na(de_Results$entrez))
+if(length(na_idx) != 0) de_Results <- de_Results[-na_idx, ]
+
+fullPath_df <- as.data.frame(matrix(nrow = 0, ncol = 10))
+for (i in seq(1:nrow(tbl))) {
+  # subset DE results to 1 test
+  sub_de <- de_Results[de_Results$Subset == tbl[i,1] &
+                         de_Results$Contrast == tbl[i,2],]
+  # get rank order of genes by log2 fold change to use as input for GSEA
+  geneList <- sub_de[ ,"Estimate"]
+  names(geneList) <- as.character(sub_de[ ,"entrez"])
+  geneList <- sort(geneList, decreasing = FALSE)
+  pathways <- reactomePathways(names(geneList))
+  # Run GSEA, build output table
+  fgseaRes <- fgseaMultilevel(pathways, geneList, minSize = 50, maxSize=1500)
+  fgseaRes <- fgseaRes %>%
+    filter(!is.na(fgseaRes$pval)) %>%
+    arrange(NES, padj) %>%
+    mutate(Subset = tbl[i,1], Contrast = tbl[i,2])
+  
+  fullPath_df <- rbind(fullPath_df, fgseaRes)
+}
+
+```
+
+## Filter GSEA results and Extract Gene Names
+
+We will than port over all significant pathways to the Shiny app, but we can also filter a simpler subset of 10 up + 10 down for each test. More than 20 per test could make the usability of a Shiny `selectInput` widget difficult. Need to convert EntrezIDs back to Gene names from the WTA assay as well for compatibility with volcano plot.
+
+``` {r extnames, message = FALSE}
+# Simplify to just a few columns
+fullPath_df <- fullPath_df %>%
+  dplyr::select(-c(pval, log2err, ES))
+
+# build named vector of EntrezID to Gene Name for all genes in pathway
+entIDs <- c()
+for (x in seq(1:nrow(fullPath_df))) entIDs <- c(entIDs, fullPath_df$leadingEdge[[x]])
+entIDs <- unique(entIDs)
+names(entIDs) <- entIDs
+entIDs <- mapIds(org.Hs.eg.db, names(entIDs), 'SYMBOL','ENTREZID')
+# translate leadingEdge column back to Gene Names
+for (x in seq(1:nrow(fullPath_df))) {
+  fullPath_df$leadingEdge[[x]] <- paste0(as.character(entIDs[fullPath_df$leadingEdge[[x]]]),
+                                      collapse = ',')
+}
+
+# Filter Pathway dataframe
+sigpath_df <- as.data.frame(matrix(nrow = 0, ncol = 7))
+for (i in seq(1:nrow(tbl))) {
+  sub_pth <- fullPath_df[fullPath_df$Subset == tbl[i,1] &
+                           fullPath_df$Contrast == tbl[i,2], c(1,5,6,7)]
+  sigpath_df <- rbind(sigpath_df, sub_pth[1:10, ],
+                      sub_pth[(nrow(sub_pth)-9):nrow(sub_pth), ])
+}
+
+```
+
+# Final Outputs
+
+## Output Results for Shiny
+
+We'll save objects for use in the Shiny app. We need only the full DE dataframe and the GSEA dataframe. Everything else can be dropped. Finish with a simple review of the dimensions of objects and what columns we keep. Ultimately, only 3 objects compressed to 1.5Mb.
+
+``` {r output}
+save(de_Results, sigpath_df, fullPath_df, file = "Output/ShinyObj.RData")
+
+# simple table
+outp <- data.frame(de_Results = c(dim(de_Results), toString(names(de_Results))),
+                   sigpath_df = c(dim(sigpath_df), toString(names(sigpath_df))),
+                   fullPath_df = c(dim(fullPath_df), toString(names(fullPath_df))))
+rownames(outp) = c("# Rows","# Columns", "Headers")
+kable(t(outp), align = 'ccl') %>%
+  kable_classic(full_width = FALSE)
+
+```
+
+# Explore the DE & Pathway Data
+
+To explore this data in the accompanying Shiny dashboard, navigate to:
+
+<https://pmross0098.shinyapps.io/PRoss_DEDashboard/>
+
+Thanks!
+
+-Marty
