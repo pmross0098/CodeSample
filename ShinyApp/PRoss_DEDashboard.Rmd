@@ -1,0 +1,201 @@
+---
+title: "Differential Expression Dataset: Human Kidney"
+output: 
+  flexdashboard::flex_dashboard:
+  orientation: columns
+  vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(plotly)
+library(shiny)
+
+load("ShInput/ShinyObj.RData")
+# translate p-vals to -log space
+de_Results$Significance <- -log10(de_Results$FDR)
+fullPath_df$Significance <- -log10(fullPath_df$padj)
+
+# Colorset
+clrs <- c("gray", "#515151", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")
+names(clrs) <- c("nosig", "nodelt", "normal", "DKD", "glomerulus", "tubule")
+# Set colors based on cutoffs, break up Contrast
+de_Results <- de_Results %>%
+  dplyr::mutate(clr = 'nodelt') %>%
+  tidyr::separate(Contrast, into = c('right','left'), sep = ' - ', remove = F)
+de_Results$clr[de_Results$Estimate >= 0.5] <- de_Results$right[which(de_Results$Estimate >= 0.5)]
+de_Results$clr[de_Results$Estimate <= -0.5] <- de_Results$left[which(de_Results$Estimate <= -0.5)]
+de_Results$clr[de_Results$FDR > 0.05] <- 'nosig'
+
+```
+
+
+DE Results
+======
+
+Column {.sidebar}
+------
+### Graph Criteria
+
+This is an interactive tool to investigate the differential Expression results from 10,048 genes over 221 kidney samples. Choose first the test of interest, then the subset of data. A final dropdown menu offers the top 20 enriched Reactome pathways, and the choice will highlight the genes in pink for that pathway.
+
+``` {r}
+
+selectInput(inputId = "Test", label = "Select Test", choices = unique(de_Results$Contrast),
+            selected = 1, multiple = FALSE)
+
+selectInput(inputId = "Subset", label = "Select Data Subset", 
+            choices = NULL,
+            selected = NULL, multiple = FALSE)
+
+selectInput(inputId = "Pathways", label = "Select Pathway of Interest", 
+            choices = NULL,
+            selected = NULL, multiple = FALSE)
+
+observeEvent(input$Test,
+             {updateSelectInput(session, input = "Subset",
+                                choices = unique(de_Results[de_Results$Contrast == input$Test,]$Subset))})
+observeEvent(input$Subset,
+             {updateSelectInput(session, input = "Pathways",
+                                choices = sigpath_df[sigpath_df$Subset == input$Subset &
+                                                       sigpath_df$Contrast == input$Test, ]$pathway)})
+
+```
+
+Review the data in a volcano plot, MA plot, or pathway volcano plot. On the Expression page, a simple violin/boxplot by data subset allows review of log2 mean counts by gene.
+
+Column {.tabset}
+-------------------
+
+### Volcano Plot
+
+Cutoffs set to +/- 0.5 log2 fold change and FDR < 0.05.
+
+```{r}
+de_rct <- reactive({
+  de_Results %>%
+    filter(Contrast == input$Test) %>%
+    filter(Subset == input$Subset)})
+# vector of genes for pathway of interest
+genes <- reactive({
+  gs <- sigpath_df$leadingEdge[sigpath_df$pathway == input$Pathways &
+                                 sigpath_df$Subset == input$Subset &
+                                 sigpath_df$Contrast == input$Test]
+  str_split(gs, pattern = ',')[[1]]
+})
+
+renderPlotly({
+  sub <- de_rct()
+  xlabel <- str_split(str_to_title(input$Test), ' - ')[[1]]
+  xlabel <- paste0("← Higher in ", xlabel[2], "  |  Higher in ", xlabel[1], " →")
+  mx <- max(abs(sub$Estimate))
+  ggplotly(ggplot(sub[!sub$Gene %in% genes(), ], 
+                  aes(x = Estimate, y = Significance, color = clr, text = Gene)) +
+    geom_vline(xintercept = 0.5, lty = 'dashed', lwd = 0.5, color = 'gray') +
+    geom_vline(xintercept = -0.5, lty = 'dashed', lwd = 0.5, color = 'gray') +
+    geom_hline(aes(yintercept = -log10(0.05)),
+                 color = 'deeppink', alpha = 0.5, linetype = 'dashed', linewidth = 0.5) +
+    geom_point(size = 2, alpha = 0.65) +
+    scale_colour_manual(values = clrs) +
+    geom_point(data = sub[sub$Gene %in% genes(), ], color = "hotpink") +
+    theme(legend.position="none") +
+    theme_bw() +
+    xlim(-mx * 1.1, mx * 1.1) +
+    labs(title = str_replace(str_to_title(input$Test), ' - ', ' versus '),
+         subtitle = paste0("Subset: ", input$Subset),
+         x = paste(xlabel, "\nlog2 Fold Change"),
+         y = "-log10(FDR)"), #expression(paste(-log[10], italic(" (p)")))
+    tooltip = "text") %>% layout(showlegend = FALSE)
+})
+
+```
+
+### MA Plot
+
+Colored points indicate genes beyond fold change and FDR cutoffs. Pink points are genes in the highlighted pathway.
+
+```{r}
+# Layer points atop one another for MA plot
+renderPlotly({
+  sub <- de_rct()
+  xlabel <- str_split(str_to_title(input$Test), ' - ')[[1]]
+  xlabel <- paste0("← Higher in ", xlabel[2], "  |  Higher in ", xlabel[1], " →")
+  mx <- max(abs(sub$Estimate))
+  ggplotly(ggplot(sub[!sub$Gene %in% genes() & sub$clr %in% c("nosig", "nodelt"), ], 
+                  aes(x = mn_exp, y = Estimate, color = clr, text = Gene)) +
+    geom_point(size = 2, alpha = 0.65) +
+    scale_color_manual(values = clrs) +
+    geom_point(data = sub[!sub$Gene %in% genes() & !sub$clr %in% c("nosig", "nodelt"), ]) +
+    geom_point(data = sub[sub$Gene %in% genes(), ], color = "hotpink") +
+    theme(legend.position="none") +
+    theme_bw() +
+    ylim(-mx * 1.1, mx * 1.1) +
+    labs(title = str_replace(str_to_title(input$Test), ' - ', ' versus '),
+         subtitle = paste0("Subset: ", input$Subset),
+         y = paste(xlabel, "\nlog2 Fold Change"),
+         x = "Mean log2 Expression"), 
+    tooltip = "text") %>% layout(showlegend = FALSE)
+})
+
+```
+
+### Pathway Analysis
+
+```{r}
+pw_rct <- reactive({
+  fullPath_df %>%
+    filter(Contrast == input$Test) %>%
+    filter(Subset == input$Subset)})
+
+renderPlotly({
+  xlabel <- str_split(str_to_title(input$Test), ' - ')[[1]]
+  xlabel <- paste0("← Enriched in ", xlabel[2], "  |  Enriched in ", xlabel[1], " →")
+  mx <- max(abs(pw_rct()$NES))
+  ggplotly(ggplot(pw_rct()[pw_rct()$pathway != input$Pathways, ], 
+                  aes(x = NES, y = Significance, text = pathway)) +
+    geom_point(color = "gray25") +
+    geom_point(data = pw_rct()[pw_rct()$pathway == input$Pathways, ], color = "hotpink") +
+    theme_bw() +
+    xlim(-mx * 1.1, mx * 1.1) +
+    labs(title = str_replace(str_to_title(input$Test), ' - ', ' versus '),
+         y = "-log(Adjusted p-value)",
+         x = paste(xlabel, "\nNormalized Enrichment Score")), 
+  tooltip = "text") %>% layout(showlegend = FALSE)
+
+})
+
+
+```
+
+Expression
+=======
+
+Column {.sidebar}
+-------------------
+
+### Mean Log2 Expression
+
+Note that for this public dataset from the `GeoMxWorkflows` vignette, counts have been Q3 normalized and log2 transformed.
+
+Column
+-------------------
+
+```{r}
+
+renderPlotly({
+  ggplotly(ggplot(de_Results, aes(x = Subset, y = mn_exp, fill = Subset)) +
+    geom_boxplot() +
+    scale_fill_manual(values = clrs) +
+    geom_violin(alpha = 0.3) +
+    # scale_color_manual(values = clrs) +
+    labs(title = "Log2 Mean Expression by Data Subset", y = "Log2 Expression") +
+    theme_bw() +
+    theme(axis.title.x = element_blank(),
+          legend.position="none"))
+})
+
+```
+
+
